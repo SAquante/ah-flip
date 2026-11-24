@@ -1,6 +1,7 @@
 package com.bbb.flip
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -40,6 +41,17 @@ class ParsingTest {
     }
 
     @Test
+    fun ageCountsFromTheScanTimestamp() {
+        val scan = "2026-11-23T22:24:04.000Z"
+        val scanMs = java.time.Instant.parse(scan).toEpochMilli()
+        // the scan is 12 minutes old, whatever the timezone of the device
+        assertEquals("12 мин назад", Money.age(scan, scanMs + 12 * 60_000))
+        assertEquals("только что", Money.age(scan, scanMs + 30_000))
+        assertEquals("1 ч назад", Money.age(scan, scanMs + 61 * 60_000))
+        assertEquals("2 дн назад", Money.age(scan, scanMs + 2 * 24 * 60 * 60_000L))
+    }
+
+    @Test
     fun moneyFormatsCopper() {
         assertEquals("0м", Money.full(0))
         assertEquals("12м", Money.full(12))
@@ -69,5 +81,52 @@ class ParsingTest {
         assertEquals(480317L, row.profit)
         assertEquals(2 * 6793L, row.reagents.single().unitPrice!! * row.reagents.single().quantity)
         assertTrue((row.roi ?: 0.0) > 3000)
+    }
+
+    @Test
+    fun discountIsMeasuredAgainstMarketValue() {
+        val row = apiJson.decodeFromString<SearchItem>(
+            """{"id":1,"name":"X","market_value":1000,"effective_price":600,"buyout":600}""",
+        )
+        assertEquals(40.0, row.discountPercent!!, 0.001)
+
+        // no market value: nothing to compare against
+        val bare = apiJson.decodeFromString<SearchItem>("""{"id":2,"name":"Y","buyout":600}""")
+        assertNull(bare.discountPercent)
+
+        // a listing above market value is a negative discount, not a crash
+        val above = apiJson.decodeFromString<SearchItem>(
+            """{"id":3,"name":"Z","market_value":100,"effective_price":250}""",
+        )
+        assertEquals(-150.0, above.discountPercent!!, 0.001)
+    }
+
+    @Test
+    fun auctionUrlsCarryEveryFilter() {
+        val url = Api.searchUrl(
+            region = "eu", realmId = 440484, faction = "alliance",
+            query = "луноткань", classId = 7, subclassId = 5, quality = 2,
+            page = 3, limit = 100,
+        )
+        assertTrue(url.startsWith("/api/items/search?gameVersion=forever&region=eu"))
+        assertTrue(url.contains("realmId=440484"))
+        assertTrue(url.contains("auctionHouseId=2"))       // alliance house
+        assertTrue(url.contains("page=3"))
+        assertTrue(url.contains("classId=7"))
+        assertTrue(url.contains("subclassId=5"))
+        assertTrue(url.contains("quality=2"))
+        assertTrue(url.contains("q=%D0%BB"))               // cyrillic is url-encoded
+
+        // horde uses its own auction house id
+        assertTrue(
+            Api.searchUrl("eu", 440484, "horde").contains("auctionHouseId=6"),
+        )
+    }
+
+    @Test
+    fun listUrlsStayUnderTheWebViewBodyLimit() {
+        // The WebView reliably delivers ~40 KB and stalls above that, so pages are small.
+        assertTrue(Api.disenchantUrl("eu", 440484, "alliance").contains("limit=20"))
+        assertTrue(Api.craftingUrl("eu", 440484, "alliance", "tailoring").contains("limit=20"))
     }
 }

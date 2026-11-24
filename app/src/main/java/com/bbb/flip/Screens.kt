@@ -41,22 +41,24 @@ import androidx.compose.ui.unit.sp
 // ------------------------------------------------------------------ summary
 
 @Composable
-fun SummaryScreen(state: UiState) {
-    LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        item { MarketCard(state) }
-        item { PotentialCard(state) }
+fun SummaryScreen(state: UiState, vm: AppViewModel) {
+    PullRefresh(refreshing = state.loading, onRefresh = { vm.refresh() }) {
+        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { MarketCard(state) }
+            item { PotentialCard(state) }
 
-        if (state.flips.isNotEmpty()) {
-            item { ListHeader("Топ НПС-флипов") }
-            items(state.flips.take(3), key = { "f${it.itemId}" }) { FlipCard(it) }
-        }
-        if (state.disenchant.isNotEmpty()) {
-            item { ListHeader("Лучшее распыление") }
-            items(state.disenchant.take(3), key = { "d${it.itemId}" }) { DeCard(it) }
-        }
-        if (state.crafts.isNotEmpty()) {
-            item { ListHeader("Лучший крафт (${state.professionLabel})") }
-            items(state.crafts.take(3), key = { "c${it.recipeId}" }) { CraftCard(it) }
+            if (state.flips.isNotEmpty()) {
+                item { ListHeader("Топ НПС-флипов") }
+                items(state.flips.take(3), key = { "f${it.itemId}" }) { FlipCard(it) }
+            }
+            if (state.disenchant.isNotEmpty()) {
+                item { ListHeader("Лучшее распыление") }
+                items(state.disenchant.take(3), key = { "d${it.itemId}" }) { DeCard(it) }
+            }
+            if (state.crafts.isNotEmpty()) {
+                item { ListHeader("Лучший крафт (${state.professionLabel})") }
+                items(state.crafts.take(3), key = { "c${it.recipeId}" }) { CraftCard(it) }
+            }
         }
     }
 }
@@ -86,7 +88,14 @@ private fun MarketCard(state: UiState) {
             StatRow("Рецептов", "${state.craftsTotal} шт")
             StatRow("Прибыльных распылов", "${state.disenchant.count { (it.margin ?: 0) > 0 }} шт", Good)
             if (state.lastUpdated > 0) {
-                StatRow("Обновлено", Money.age(java.time.Instant.ofEpochMilli(state.lastUpdated).toString()))
+                StatRow(
+                    "Обновлено",
+                    Money.age(java.time.Instant.ofEpochMilli(state.lastUpdated).toString()),
+                    if (state.refreshFailed) Bad else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            if (state.refreshFailed) {
+                Caption("Не удалось обновить — показаны прошлые данные", Bad)
             }
         }
     }
@@ -128,7 +137,11 @@ fun FlipsScreen(state: UiState, vm: AppViewModel) {
         ) {
             Column(Modifier.weight(1f)) {
                 Caption("Скан аукциона: ${Money.age(state.house?.lastObservedAt)}")
-                Caption("Обновлено: ${if (state.lastUpdated > 0) Money.age(java.time.Instant.ofEpochMilli(state.lastUpdated).toString()) else "—"}")
+                Caption(
+                    "Обновлено: ${if (state.lastUpdated > 0) Money.age(java.time.Instant.ofEpochMilli(state.lastUpdated).toString()) else "—"}",
+                    if (state.refreshFailed) Bad else Dim,
+                )
+                if (state.refreshFailed) Caption("Не удалось обновить — показаны прошлые данные", Bad)
             }
             TextButton(onClick = { vm.refresh() }, enabled = !state.loading) {
                 if (state.loading) {
@@ -160,7 +173,9 @@ fun FlipsScreen(state: UiState, vm: AppViewModel) {
                 )
             }
         }
-        if (state.flipsTab == 0) FlipsList(state) else DealsList(state)
+        PullRefresh(refreshing = state.loading, onRefresh = { vm.refresh() }) {
+            if (state.flipsTab == 0) FlipsList(state) else DealsList(state)
+        }
     }
 }
 
@@ -299,13 +314,15 @@ fun DisenchantScreen(state: UiState, vm: AppViewModel) {
                 label = { Text("от 1г") },
             )
         }
-        if (rows.isEmpty()) {
-            EmptyState("Нет выгодных распылов при текущем фильтре")
-            return@Column
-        }
-        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { Caption("Купить зелёный/синий предмет, распылить и продать материалы (за вычетом комиссии).") }
-            items(rows, key = { it.itemId }) { DeCard(it) }
+        PullRefresh(refreshing = state.loading, onRefresh = { vm.refresh() }) {
+            if (rows.isEmpty()) {
+                EmptyState("Нет выгодных распылов при текущем фильтре")
+            } else {
+                LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item { Caption("Купить зелёный/синий предмет, распылить и продать материалы (за вычетом комиссии).") }
+                    items(rows, key = { it.itemId }) { DeCard(it) }
+                }
+            }
         }
     }
 }
@@ -383,13 +400,15 @@ fun CraftScreen(state: UiState, vm: AppViewModel) {
         val rows = state.crafts
             .filter { !state.onlyProfitable || ((it.profit ?: 0) > 0) }
             .filter { (it.profit ?: 0) >= state.minProfit }
-        if (rows.isEmpty()) {
-            EmptyState("Прибыльных рецептов нет")
-            return@Column
-        }
-        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { Caption("Прибыль — после комиссии аукциона, по текущим ценам реагентов.") }
-            items(rows, key = { it.recipeId }) { CraftCard(it) }
+        PullRefresh(refreshing = state.loading, onRefresh = { vm.refresh() }) {
+            if (rows.isEmpty()) {
+                EmptyState("Прибыльных рецептов нет")
+            } else {
+                LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item { Caption("Прибыль — после комиссии аукциона, по текущим ценам реагентов.") }
+                    items(rows, key = { it.recipeId }) { CraftCard(it) }
+                }
+            }
         }
     }
 }
@@ -483,15 +502,18 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
         }
-        if (state.searchResults.isEmpty()) {
-            EmptyState(
-                if (state.searchQuery.isBlank()) "Введите название предмета — проверю цену на ауке и у НПС"
-                else "Ничего не найдено",
-            )
-            return@Column
-        }
-        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(state.searchResults, key = { it.id }) { SearchCard(it) }
+        // Pulling down repeats the last search, so results can be re-priced without retyping.
+        PullRefresh(refreshing = state.searching, onRefresh = { if (state.searchQuery.isNotBlank()) vm.search(state.searchQuery) }) {
+            if (state.searchResults.isEmpty()) {
+                EmptyState(
+                    if (state.searchQuery.isBlank()) "Введите название предмета — проверю цену на ауке и у НПС"
+                    else "Ничего не найдено",
+                )
+            } else {
+                LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(state.searchResults, key = { it.id }) { SearchCard(it) }
+                }
+            }
         }
     }
 }

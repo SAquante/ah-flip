@@ -43,7 +43,7 @@ data class UiState(
     val ahClassId: Int? = null,
     val ahSubclassId: Int? = null,
     val ahQuality: Int? = null,
-    val ahSort: String = "price",       // price | priceDesc | name | quantity
+    val ahSort: String = "best",      // best | price | priceDesc | name | quantity | vendor
     val ahPage: Int = 1,
     val ahItems: List<SearchItem> = emptyList(),
     val ahTotal: Int = 0,
@@ -53,6 +53,8 @@ data class UiState(
     val trending: List<TrendItem> = emptyList(),
     val trendingWindow: String? = null,
     val statsLoading: Boolean = false,
+    /** True when the last refresh could not fetch every section; data shown may be older. */
+    val refreshFailed: Boolean = false,
 ) {
     val factionLabel: String get() = if (faction == "horde") "Орда" else "Альянс"
     val professionLabel: String
@@ -214,23 +216,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() {
         if (_state.value.loading) return
+        android.util.Log.d("BBB", "refresh: started")
         viewModelScope.launch {
             val s0 = _state.value
             update { it.copy(loading = true, error = null, phase = "Подключаюсь к аукциону…") }
             val failures = mutableListOf<String>()
 
-            suspend fun <T> load(phase: String, url: String, cache: String? = null, decode: (String) -> T): T? {
+            suspend fun <T> loadWith(phase: String, block: suspend () -> T): T? {
                 update { it.copy(phase = phase) }
                 return try {
-                    val body = client.get(url)
-                    if (cache != null) writeCache(cache, body)
-                    decode(body)
+                    block()
                 } catch (e: Exception) {
                     android.util.Log.w("BBB", "load failed: $phase", e)
                     failures += (e.message ?: "ошибка").take(120)
                     null
                 }
             }
+
+            suspend fun <T> load(phase: String, url: String, cache: String? = null, decode: (String) -> T): T? =
+                loadWith(phase) {
+                    val body = client.get(url)
+                    if (cache != null) writeCache(cache, body)
+                    decode(body)
+                }
 
             val deals = load(
                 "Считаю скидки…",
@@ -239,21 +247,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             ) { apiJson.decodeFromString<DealsResponse>(it) }
             update { it.copy(phase = "Считаю распыление…") }
             val disenchant = runCatching {
-                // Rows are ROI-ordered, so stop as soon as a page contains nothing profitable.
-                val rows = mutableListOf<DeRow>()
-                var total = 0
-                for (page in 1..2) {
-                    val body = client.get(Api.disenchantUrl(s0.region, s0.realmId, s0.faction, page))
-                    val parsed = apiJson.decodeFromString<DisenchantResponse>(body)
-                    rows += parsed.rows
-                    total = parsed.pagination?.totalCount ?: rows.size
-                    if (parsed.rows.none { (it.margin ?: 0) > 0 }) break
-                }
-                val merged = DisenchantResponse(
-                    rows = rows.sortedByDescending { it.margin ?: Long.MIN_VALUE },
-                    pagination = Pagination(totalCount = total),
+                // Rows are ROI-ordered, so one page already holds every profitable row.
+                val parsed = apiJson.decodeFromString<DisenchantResponse>(
+                    client.get(Api.disenchantUrl(s0.region, s0.realmId, s0.faction, 1)),
                 )
-                // Cache what is actually shown (both pages merged), not just the first page.
+                val merged = DisenchantResponse(
+                    rows = parsed.rows.sortedByDescending { it.margin ?: Long.MIN_VALUE },
+                    pagination = parsed.pagination,
+                )
                 writeCache(cacheKey(s0, "disenchant"), apiJson.encodeToString(DisenchantResponse.serializer(), merged))
                 merged
             }.onFailure {
@@ -262,19 +263,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }.getOrNull()
             update { it.copy(phase = "Считаю крафт…") }
             val crafting = runCatching {
-                // Ranked by est. profit/day, so the first pages hold everything worth showing.
-                val rows = mutableListOf<CraftRow>()
-                var total = 0
-                for (page in 1..2) {
-                    val body = client.get(Api.craftingUrl(s0.region, s0.realmId, s0.faction, s0.profession, page))
-                    val parsed = apiJson.decodeFromString<CraftingResponse>(body)
-                    rows += parsed.rows
-                    total = parsed.pagination?.totalCount ?: rows.size
-                    if (parsed.rows.none { (it.profit ?: 0) > 0 }) break
-                }
-                val merged = CraftingResponse(rows = rows, pagination = Pagination(totalCount = total))
-                writeCache(cacheKey(s0, "craft-${s0.profession}"), apiJson.encodeToString(CraftingResponse.serializer(), merged))
-                merged
+                // Ranked by est. profit/day, so the first page is the whole "worth showing" set.
+                val parsed = apiJson.decodeFromString<CraftingResponse>(
+                    client.get(Api.craftingUrl(s0.region, s0.realmId, s0.faction, s0.profession, 1)),
+                )
+                writeCache(cacheKey(s0, "craft-${s0.profession}"), apiJson.encodeToString(CraftingResponse.serializer(), parsed))
+                parsed
             }.onFailure {
                 android.util.Log.w("BBB", "load failed: craft", it)
                 failures += (it.message ?: "ошибка").take(120)
@@ -285,7 +279,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     apiJson.decodeFromString<RealmResponse>(it).data
                 }
             } else null
+            // The auction tab must show the same fresh scan, not whatever it loaded earlier.
+            val auction = loadWith("Обновляю аукцион…") { fetchAuction(s0) }
 
+            val everythingOk = deals != null && disenchant != null && crafting != null
             update {
                 it.copy(
                     loading = false,
@@ -302,7 +299,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     crafts = crafting?.rows ?: it.crafts,
                     craftsTotal = crafting?.pagination?.totalCount ?: it.craftsTotal,
                     realms = realms ?: it.realms,
-                    lastUpdated = System.currentTimeMillis(),
+                    ahItems = auction?.let { r -> sortedRows(r.data, s0.ahSort) } ?: it.ahItems,
+                    ahTotal = auction?.pagination?.totalCount ?: it.ahTotal,
+                    trending = it.trending,
+                    trendingWindow = it.trendingWindow,
+                    // Never claim freshness for a partial refresh: keep the old stamp so the
+                    // "Обновлено" line stays honest and the stale data is obvious.
+                    lastUpdated = if (everythingOk) System.currentTimeMillis() else it.lastUpdated,
+                    refreshFailed = !everythingOk,
                 )
             }
             translateLoaded()
@@ -333,9 +337,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         "price" -> items.sortedWith(compareBy(nullsLast()) { it.effectivePrice ?: it.buyout })
         "priceDesc" -> items.sortedWith(compareByDescending(nullsFirst()) { it.effectivePrice ?: it.buyout })
         "vendor" -> items.sortedByDescending { it.vendorProfit ?: Long.MIN_VALUE }
+        // "Лучшие предложения": biggest gap between the cheapest listing and the market price.
+        "best" -> items.sortedByDescending { it.discountPercent ?: Double.MIN_VALUE }
         "name" -> items.sortedBy { RuNames.get(it.blizzardId) ?: it.name }
         else -> items
     }
+
+    /** Fetches one page of the auction browser with the current filters. */
+    private suspend fun fetchAuction(s: UiState): SearchResponse = apiJson.decodeFromString(
+        client.get(
+            Api.searchUrl(
+                s.region, s.realmId, s.faction,
+                query = s.ahQuery,
+                classId = s.ahClassId,
+                subclassId = s.ahSubclassId,
+                quality = s.ahQuality,
+                sortBy = if (s.ahSort == "name") "name" else "quantity",
+                sortOrder = if (s.ahSort == "name") "asc" else "desc",
+                page = s.ahPage,
+                limit = 100,
+            ),
+        ),
+    )
 
     fun loadAuction() {
         if (_state.value.ahLoading) return
@@ -343,20 +366,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val s = _state.value
             update { it.copy(ahLoading = true, error = null) }
             try {
-                val body = client.get(
-                    Api.searchUrl(
-                        s.region, s.realmId, s.faction,
-                        query = s.ahQuery,
-                        classId = s.ahClassId,
-                        subclassId = s.ahSubclassId,
-                        quality = s.ahQuality,
-                        sortBy = if (s.ahSort == "name") "name" else "quantity",
-                        sortOrder = if (s.ahSort == "name") "asc" else "desc",
-                        page = s.ahPage,
-                        limit = 100,
-                    ),
-                )
-                val parsed = apiJson.decodeFromString<SearchResponse>(body)
+                val parsed = fetchAuction(s)
                 update {
                     it.copy(
                         ahLoading = false,

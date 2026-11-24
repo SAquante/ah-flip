@@ -308,6 +308,15 @@ data class SearchItem(
 ) {
     /** Buying from the AH and selling to an NPC vendor. */
     val vendorProfit: Long? get() = sellPrice?.let { s -> buyout?.let { s - it } }
+
+    /** How far the cheapest listing sits under the market value, in percent. */
+    val discountPercent: Double?
+        get() {
+            val market = marketValue ?: return null
+            val price = effectivePrice ?: buyout ?: return null
+            if (market <= 0 || price <= 0) return null
+            return (market - price) * 100.0 / market
+        }
 }
 
 @Serializable

@@ -139,27 +139,28 @@ fun AuctionScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        if (state.ahItems.isEmpty()) {
-            if (state.ahLoading) EmptyState("Загружаю аукцион…") else EmptyState("Ничего не найдено")
-            return@Column
-        }
-
-        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            item {
-                Caption("Найдено ${state.ahTotal} предметов · страница ${state.ahPage}")
-            }
-            items(state.ahItems, key = { it.id }) { AuctionRow(it) }
-            item {
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                ) {
-                    TextButton(onClick = { vm.setAhPage(state.ahPage - 1) }, enabled = state.ahPage > 1) {
-                        Text("‹ Назад", color = if (state.ahPage > 1) Gold else Dim)
+        PullRefresh(refreshing = state.ahLoading, onRefresh = { vm.loadAuction() }) {
+            if (state.ahItems.isEmpty()) {
+                EmptyState(if (state.ahLoading) "Загружаю аукцион…" else "Ничего не найдено")
+            } else {
+                LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item {
+                        Caption("Найдено ${state.ahTotal} предметов · страница ${state.ahPage}")
                     }
-                    Text("${state.ahPage}", color = Dim, fontSize = 13.sp)
-                    TextButton(onClick = { vm.setAhPage(state.ahPage + 1) }) {
-                        Text("Вперёд ›", color = Gold)
+                    items(state.ahItems, key = { it.id }) { AuctionRow(it) }
+                    item {
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                        ) {
+                            TextButton(onClick = { vm.setAhPage(state.ahPage - 1) }, enabled = state.ahPage > 1) {
+                                Text("‹ Назад", color = if (state.ahPage > 1) Gold else Dim)
+                            }
+                            Text("${state.ahPage}", color = Dim, fontSize = 13.sp)
+                            TextButton(onClick = { vm.setAhPage(state.ahPage + 1) }) {
+                                Text("Вперёд ›", color = Gold)
+                            }
+                        }
                     }
                 }
             }
@@ -176,7 +177,9 @@ private fun windowLabel(window: String?): String = when (window) {
     else -> window
 }
 
-private val SORTS = listOf(    "quantity" to "По количеству",
+private val SORTS = listOf(
+    "best" to "Лучшие",
+    "quantity" to "По количеству",
     "price" to "Цена ↑",
     "priceDesc" to "Цена ↓",
     "vendor" to "НПС-прибыль",
@@ -212,7 +215,10 @@ private fun AuctionRow(row: SearchItem) {
                 }
                 Column(horizontalAlignment = Alignment.End) {
                     Money(row.effectivePrice ?: row.buyout, Gold, bold = true, fontSize = 14)
-                    if (vendorProfit != null) {
+                    val discount = row.discountPercent
+                    if (discount != null && discount >= 5.0) {
+                        Caption("−${Money.percent(discount)} к рынку", Good)
+                    } else if (vendorProfit != null) {
                         Caption(
                             "НПС ${if (vendorProfit >= 0) "+" else "−"}${Money.full(kotlin.math.abs(vendorProfit))}",
                             if (vendorProfit > 0) Good else Dim,
@@ -245,16 +251,18 @@ private fun AuctionRow(row: SearchItem) {
 fun StatsScreen(state: UiState, vm: AppViewModel) {
     LaunchedEffect(Unit) { if (state.trending.isEmpty()) vm.loadTrending() }
 
-    LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        item { StatsSummary(state) }
-        item { ListHeader("Движения рынка за ${windowLabel(state.trendingWindow)}") }
-        if (state.trending.isEmpty()) {
-            item { EmptyState(if (state.statsLoading) "Считаю статистику…" else "Нет данных") }
-        } else {
-            items(state.trending, key = { it.itemId }) { TrendRow(it) }
+    PullRefresh(refreshing = state.statsLoading, onRefresh = { vm.loadTrending() }) {
+        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { StatsSummary(state) }
+            item { ListHeader("Движения рынка за ${windowLabel(state.trendingWindow)}") }
+            if (state.trending.isEmpty()) {
+                item { EmptyState(if (state.statsLoading) "Считаю статистику…" else "Нет данных") }
+            } else {
+                items(state.trending, key = { it.itemId }) { TrendRow(it) }
+            }
+            item { ListHeader("Сводка по рынку") }
+            item { MarketStatsCard(state) }
         }
-        item { ListHeader("Сводка по рынку") }
-        item { MarketStatsCard(state) }
     }
 }
 

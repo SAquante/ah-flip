@@ -58,16 +58,18 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         vm = androidx.lifecycle.ViewModelProvider(this)[AppViewModel::class.java]
 
-        // A small *visible* WebView on top: it holds the Cloudflare clearance for every API
-        // call. Fully hidden or zero-alpha WebViews get their timers throttled, which makes
-        // fetch() promises stall, so it stays a few dp of real, unobstructed surface.
-        val side = (6 * resources.displayMetrics.density).toInt()
+        // Full-size WebView underneath the Compose UI: it solves the Cloudflare challenge and
+        // renders each API document for us to read. It must be a real on-screen view, because a
+        // hidden or tiny WebView gets its renderer frozen and documents stop loading.
         webView = WebView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(side, side).apply {
-                gravity = android.view.Gravity.TOP or android.view.Gravity.START
-            }
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            setBackgroundColor(0xFF11151C.toInt())
         }
         val root = FrameLayout(this).apply {
+            addView(webView)
             addView(
                 androidx.compose.ui.platform.ComposeView(this@MainActivity).apply {
                     setContent {
@@ -82,7 +84,6 @@ class MainActivity : ComponentActivity() {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                 ),
             )
-            addView(webView)
         }
         setContentView(root)
         vm.bindWebView(webView)
@@ -104,7 +105,7 @@ private fun AppRoot(state: UiState, vm: AppViewModel) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when {
                     state.settingsOpen -> SettingsScreen(state, vm)
-                    state.tab == 0 -> SummaryScreen(state)
+                    state.tab == 0 -> SummaryScreen(state, vm)
                     state.tab == 1 -> AuctionScreen(state, vm)
                     state.tab == 2 -> FlipsScreen(state, vm)
                     state.tab == 3 -> DisenchantScreen(state, vm)

@@ -2,7 +2,6 @@ package com.bbb.flip
 
 import android.util.Log
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -19,60 +18,52 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
 import java.io.IOException
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
 /**
- * BootyBayBroker is behind a Cloudflare managed challenge and checks the TLS fingerprint, so a
- * plain HTTP client gets 403 even with the clearance cookie. Requests are therefore made as
- * same-origin fetch() calls inside a real WebView that has solved the challenge.
+ * BootyBayBroker sits behind a Cloudflare managed challenge and checks the TLS fingerprint, so a
+ * plain HTTP client gets 403 even with the clearance cookie.
  *
- * The WebView stays parked on one page — navigating it to a JSON endpoint makes WebView treat
- * the response as a download and drop the document.
+ * Transport: the WebView is navigated straight to the API URL and the rendered JSON document is
+ * read back. Navigation gives every request its own document, which sidesteps the two things that
+ * made same-document `fetch()` unreliable here — a JS context that dies after one call, and the
+ * site's own SPA scripts reloading the page mid-request.
  */
 class SiteClient {
 
-    private val pending = ConcurrentHashMap<String, CompletableDeferred<Pair<Int, String>>>()
-    private val chunks = ConcurrentHashMap<String, StringBuilder>()
     private val gate = Mutex()
     private var webView: WebView? = null
     private var ready = false
     private var bootstrapped = false
-    private val pageUrl = "${Api.BASE}/ru/forever?region=eu"
-    private var pageDone = CompletableDeferred<Unit>()
-    private var loaded = CompletableDeferred<Unit>()
-    private var pendingUrl = ""
-    /** Set after a fetch succeeds: the page's JS context must be rebuilt before the next one. */
-    private var contextStale = false
+    private var loadSeq = 0
+
+    /** Bumped by every completed page load, so navigation can be awaited reliably. */
+    @Volatile
+    private var loads = 0
 
     fun bind(view: WebView) {
         if (webView === view) return
         webView = view
         ready = false
         bootstrapped = false
-        pageDone = CompletableDeferred()
-        pending.clear()
-        chunks.clear()
 
         view.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            cacheMode = WebSettings.LOAD_DEFAULT
+            // Prices must be live; a cached /api/ response showed an hour-old scan.
+            cacheMode = WebSettings.LOAD_NO_CACHE
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
-        // The site's SPA registers a service worker; a stale one answers fetch() with its HTML
-        // shell or hangs it. Wipe stored page data so none survives an app upgrade.
+        // The SPA registers a service worker that would answer /api/ with its HTML shell.
         WebStorage.getInstance().deleteAllData()
         view.clearCache(true)
 
-        view.addJavascriptInterface(Bridge(), "BBB")
         view.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 Log.d(TAG, "page finished: $url")
-                if (url != null && url.startsWith(pageUrl)) pageDone.complete(Unit)
+                loads++
             }
 
             override fun shouldInterceptRequest(
@@ -82,8 +73,7 @@ class SiteClient {
                 val url = request?.url ?: return null
                 val host = url.host ?: return null
                 // Keep the document and the Cloudflare challenge; drop ads, trackers, fonts,
-                // images and SPA bundles so the hidden page stays light and never registers
-                // a service worker.
+                // images and the SPA bundles (so no service worker, and a light challenge page).
                 if (host == "challenges.cloudflare.com") return null
                 if (host.endsWith("bootybaybroker.com")) {
                     val path = url.path ?: "/"
@@ -104,38 +94,36 @@ class SiteClient {
 
     suspend fun get(path: String): String = gate.withLock {
         if (!ready) ensureReady()
-        if (contextStale) {
-            contextStale = false
-            reload()
-        }
-        var last = -1 to ""
-        repeat(6) { attempt ->
-            val result = runCatching { fetchJson(path, 12_000) }.getOrNull()
-            if (result != null && result.first in 200..299) {
-                Log.d(TAG, "GET $path -> ${result.first} ${result.second.length}b")
-                // An error envelope still parses as JSON, so surface it rather than empty data.
-                val err = runCatching { apiJson.decodeFromString<ErrorEnvelope>(result.second) }
+        val url = if (path.startsWith("http")) path else Api.BASE + path
+        var lastError = "нет ответа"
+        repeat(5) { attempt ->
+            val body = runCatching { loadJsonDocument(url) }.getOrElse {
+                lastError = it.message ?: "ошибка"
+                null
+            }
+            if (body != null) {
+                Log.d(TAG, "GET $path -> 200 ${body.length}b")
+                // An error envelope is still JSON, so surface it instead of empty data.
+                val err = runCatching { apiJson.decodeFromString<ErrorEnvelope>(body) }
                     .getOrNull()?.takeIf { it.status >= 400 }
-                if (err != null) throw IOException("${err.status} ${err.detail ?: err.title ?: ""}".trim())
-                // The page's JS context survives only one request before going stale, so the
-                // next call starts from a fresh document (cookies keep the Cloudflare pass).
-                contextStale = true
-                return result.second
+                if (err != null) {
+                    val message = "${err.status} ${err.detail ?: err.title ?: ""}".trim()
+                    if (err.status == 429) throw IOException(rateLimitMessage(body))
+                    throw IOException(message)
+                }
+                return body
             }
-            last = result ?: (-1 to "timeout")
-            Log.w(TAG, "GET $path attempt ${attempt + 1} failed: ${last.first}")
-            if (last.first == 429) {
-                // The site rate-limits per IP; retrying only extends the block.
-                val minutes = Regex("\"retry_after_seconds\"\\s*:\\s*(\\d+)")
-                    .find(last.second)?.groupValues?.get(1)?.toIntOrNull()?.let { (it + 59) / 60 }
-                throw IOException(
-                    "Аукцион временно ограничил запросы с этого IP" +
-                        (minutes?.let { ". Повторите через ~$it мин" } ?: ". Повторите позже"),
-                )
-            }
-            reload()
+            Log.w(TAG, "GET $path attempt ${attempt + 1} failed: $lastError")
+            delay(400)
         }
-        throw IOException("Аукцион не ответил (HTTP ${last.first}). Проверьте интернет и повторите.")
+        throw IOException(lastError)
+    }
+
+    private fun rateLimitMessage(body: String): String {
+        val minutes = Regex("\"retry_after_seconds\"\\s*:\\s*(\\d+)")
+            .find(body)?.groupValues?.get(1)?.toIntOrNull()?.let { (it + 59) / 60 }
+        return "Аукцион временно ограничил запросы с этого IP" +
+            (minutes?.let { ". Повторите через ~$it мин" } ?: ". Повторите позже")
     }
 
     private suspend fun ensureReady() {
@@ -143,45 +131,60 @@ class SiteClient {
         withContext(Dispatchers.Main.immediate) {
             if (!bootstrapped) {
                 bootstrapped = true
-                pageDone = CompletableDeferred()
-                view.loadUrl(pageUrl)
+                view.loadUrl(PAGE_URL)
             }
         }
-        // fetch() from a document that is still loading queues behind its resources, so wait.
-        withTimeoutOrNull(20_000) { pageDone.await() }
-        var code = 0
+        // The real page runs the challenge and sets cf_clearance.
+        waitForLoads(20_000)
+        var status = 0
         repeat(15) { attempt ->
-            delay(if (attempt == 0) 600 else 1_000)
-            code = runCatching { fetchJson("/api/config", 8_000).first }.getOrDefault(0)
-            if (code == 200) {
+            val probe = runCatching { loadJsonDocument("${Api.BASE}/api/config") }.getOrNull()
+            if (probe != null && probe.trimStart().startsWith("{")) {
                 ready = true
                 Log.d(TAG, "ready after ${attempt + 1} probe(s)")
                 return
             }
-            if (attempt == 7) reload()
+            status = attempt + 1
+            delay(700)
         }
-        throw IOException("Cloudflare не пропустил запросы (HTTP $code). Проверьте интернет и повторите.")
+        throw IOException("Cloudflare не пропустил запросы (попыток: $status). Проверьте интернет.")
     }
 
-    /** Reload the parked page so a fresh JS context (and challenge pass) is established. */
-    private suspend fun reload() {
-        val view = webView ?: throw IOException("Соединение не инициализировано")
-        pageDone = CompletableDeferred()
-        withContext(Dispatchers.Main.immediate) { view.reload() }
-        withTimeoutOrNull(12_000) { pageDone.await() }
-        delay(400)
+    /**
+     * Navigates to [url] and returns the document text. WebView treats JSON -> JSON as a download
+     * (the document never commits), so a blank document is loaded in between; the read is gated on
+     * a completed load, the document reporting [url] as its own location, and the text parsing as
+     * complete JSON.
+     */
+    private suspend fun loadJsonDocument(url: String): String {
+        navigate("about:blank", 6_000)
+        navigate(url, 20_000)
+        // onPageFinished can arrive from the previous navigation, so poll the document itself:
+        // it must be complete, report the requested URL, and parse as full JSON.
+        repeat(30) {
+            val doc = readDocument()
+            if (doc != null && doc.url.startsWith(url) && doc.text.length > 1 && !doc.html) {
+                if (runCatching { apiJson.parseToJsonElement(doc.text) }.isSuccess) return doc.text
+            }
+            delay(250)
+        }
+        throw IOException("Аукцион вернул не данные (возможно, проверка Cloudflare)")
     }
 
     private suspend fun navigate(target: String, timeoutMs: Long) {
         val view = webView ?: throw IOException("Соединение не инициализировано")
-        val done = CompletableDeferred<Unit>()
-        loaded = done
-        pendingUrl = target
         withContext(Dispatchers.Main.immediate) { view.loadUrl(target) }
-        withTimeoutOrNull(timeoutMs) { done.await() }
+        waitForLoads(timeoutMs)
     }
 
-    private class Document(val url: String, val complete: Boolean, val text: String)
+    private suspend fun waitForLoads(timeoutMs: Long) {
+        val before = loads
+        withTimeoutOrNull(timeoutMs) {
+            while (loads <= before) delay(80)
+        }
+    }
+
+    private class Document(val url: String, val html: Boolean, val text: String)
 
     /** Reads the rendered document in slices: one big evaluateJavascript call truncates. */
     private suspend fun readDocument(): Document? = withContext(Dispatchers.Main.immediate) {
@@ -189,12 +192,12 @@ class SiteClient {
         val head = evalString(
             view,
             "(document.readyState==='complete'?'1':'0') + '|' + location.href + '|' + " +
-                "(document.contentType.indexOf('json')<0 ? 'HTML:' : '')",
+                "(document.contentType.indexOf('json')<0 ? 'HTML' : 'JSON')",
         )
         val parts = head.split("|", limit = 3)
-        if (parts.size < 3) return@withContext null
+        if (parts.size < 3 || parts[0] != "1") return@withContext null
         val chunk = 40_000
-        val sb = StringBuilder(parts[2])
+        val sb = StringBuilder()
         var offset = 0
         while (true) {
             val part = evalString(
@@ -207,7 +210,7 @@ class SiteClient {
             offset += chunk
             if (offset > 4_000_000) break
         }
-        Document(parts[1], parts[0] == "1", sb.toString())
+        Document(parts[1], parts[2] == "HTML", sb.toString())
     }
 
     private suspend fun evalString(view: WebView, js: String): String {
@@ -219,60 +222,15 @@ class SiteClient {
     /** evaluateJavascript returns a JS string literal; JSON-escaped. */
     private fun decodeJsString(raw: String): String {
         val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed == "null") return ""
         if (!trimmed.startsWith("\"")) return trimmed
         return runCatching {
             (apiJson.parseToJsonElement(trimmed) as kotlinx.serialization.json.JsonPrimitive).content
         }.getOrDefault(trimmed)
     }
 
-    private suspend fun fetchJson(path: String, timeoutMs: Long): Pair<Int, String> =
-        withContext(Dispatchers.Main.immediate) {
-            val view = webView ?: throw IOException("Соединение не инициализировано")
-            // Pace requests: back-to-back fetches on the same page context fail far more often.
-            delay(250)
-            val id = UUID.randomUUID().toString()
-            val deferred = CompletableDeferred<Pair<Int, String>>()
-            val parts = StringBuilder()
-            pending[id] = deferred
-            chunks[id] = parts
-            val url = if (path.startsWith("http")) path else Api.BASE + path
-            // Large bodies cannot cross the JS bridge in one call (190 KB silently dies), so
-            // the page hands the text over in slices and then signals completion.
-            val js = "(function(){try{fetch('${esc(url)}',{credentials:'include'})" +
-                ".then(function(r){return r.text().then(function(t){" +
-                "for(var i=0;i<t.length;i+=8192){BBB.onChunk('$id',t.substr(i,8192))}" +
-                "BBB.onResult('$id',r.status)})})" +
-                ".catch(function(e){BBB.onError('$id',String(e))})}catch(e){BBB.onError('$id',String(e))}})()"
-            view.evaluateJavascript(js, null)
-            try {
-                withTimeout(timeoutMs) { deferred.await() }
-            } finally {
-                pending.remove(id)
-                chunks.remove(id)
-            }
-        }
-
-    private fun esc(value: String): String = value.replace("\\", "\\\\").replace("'", "\\'")
-
-    inner class Bridge {
-        @JavascriptInterface
-        fun onChunk(id: String, part: String) {
-            chunks[id]?.append(part)
-        }
-
-        @JavascriptInterface
-        fun onResult(id: String, status: Int) {
-            val body = chunks.remove(id)?.toString().orEmpty()
-            pending.remove(id)?.complete(status to body)
-        }
-
-        @JavascriptInterface
-        fun onError(id: String, message: String) {
-            pending.remove(id)?.complete(-1 to message)
-        }
-    }
-
     companion object {
         private const val TAG = "BBB"
+        private const val PAGE_URL = "${Api.BASE}/ru/forever?region=eu"
     }
 }

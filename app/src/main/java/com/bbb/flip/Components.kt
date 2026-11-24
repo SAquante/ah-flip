@@ -17,8 +17,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -192,4 +194,24 @@ fun verdictLabel(verdict: String?): String = when (verdict) {
     "missing" -> "нет данных"
     null, "" -> "—"
     else -> verdict
+}
+
+/**
+ * Pull-to-refresh wrapper: dragging the list down past the top starts a market refresh.
+ * A refresh takes minutes (each API call needs a fresh WebView page), so the spinner stays
+ * until it finishes and the cached data remains readable meanwhile.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PullRefresh(
+    refreshing: Boolean,
+    onRefresh: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+        content = { content() },
+    )
 }
