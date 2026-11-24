@@ -15,7 +15,9 @@ data class UiState(
     val phase: String = "",
     val error: String? = null,
     val tab: Int = 0,
-    val flipsTab: Int = 0,
+    // "Скидки рынка" by default: reselling under market value is where the money is on this
+    // market, while NPC vendor flips are almost always a few copper per item.
+    val flipsTab: Int = 1,
     val region: String = "eu",
     val realmId: Long = 440484,
     val realmLabel: String = "EU PvE",

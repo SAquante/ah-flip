@@ -47,13 +47,15 @@ fun SummaryScreen(state: UiState, vm: AppViewModel) {
             item { MarketCard(state) }
             item { PotentialCard(state) }
 
-            if (state.flips.isNotEmpty()) {
-                item { ListHeader("Топ НПС-флипов") }
-                items(state.flips.take(3), key = { "f${it.itemId}" }) { FlipCard(it) }
+            // Real money first: the best deals under market value.
+            val bestDeals = state.deals.sortedByDescending { it.resaleProfit ?: it.saving }.take(3)
+            if (bestDeals.isNotEmpty()) {
+                item { ListHeader("Лучшие скидки рынка") }
+                items(bestDeals, key = { "d${it.itemId}" }) { DealCard(it) }
             }
             if (state.disenchant.isNotEmpty()) {
                 item { ListHeader("Лучшее распыление") }
-                items(state.disenchant.take(3), key = { "d${it.itemId}" }) { DeCard(it) }
+                items(state.disenchant.take(3), key = { "e${it.itemId}" }) { DeCard(it) }
             }
             if (state.crafts.isNotEmpty()) {
                 item { ListHeader("Лучший крафт (${state.professionLabel})") }
@@ -103,16 +105,21 @@ private fun MarketCard(state: UiState) {
 
 @Composable
 private fun PotentialCard(state: UiState) {
-    val flipTotal = state.flips.sumOf { it.profit }
-    val flipCount = state.flips.count { it.unitProfit > 0 }
+    // Only meaningful flips are counted: the site's list also carries bulk junk at a few copper
+    // per item, which is not a flip anyone would actually do.
+    val realFlips = state.flips.filter { it.unitProfit >= 100 && (it.roi ?: 0.0) >= 10.0 }
+    val flipTotal = realFlips.sumOf { it.profit }
+    val bestDeal = state.deals.maxByOrNull { it.resaleProfit ?: Long.MIN_VALUE }
     val bestDe = state.disenchant.maxByOrNull { it.margin ?: Long.MIN_VALUE }
     val bestCraft = state.crafts.maxByOrNull { it.profitPerDay?.point ?: Long.MIN_VALUE }
     PanelCard {
         Column {
             SectionTitle("Потенциал")
             Spacer(Modifier.height(6.dp))
-            StatRow("НПС-флипы: всего", Money.short(flipTotal), Good)
-            Caption("$flipCount позиций дешевле, чем платит НПС")
+            StatRow("Лучшая скидка рынка", bestDeal?.let { "${ruName(it.itemId, it.name).take(22)} · ${Money.short(it.resaleProfit)}" } ?: "—", Good)
+            Caption("купить дешевле рынка и перепродать, после комиссии")
+            Spacer(Modifier.height(6.dp))
+            StatRow("НПС-флипы", if (realFlips.isEmpty()) "нет выгодных" else "${realFlips.size} на ${Money.short(flipTotal)}", if (realFlips.isEmpty()) Dim else Good)
             Spacer(Modifier.height(6.dp))
             StatRow("Лучший распыл", bestDe?.let { "${ruName(it.itemId, it.name).take(24)} · ${Money.short(it.margin)}" } ?: "—", Good)
             Spacer(Modifier.height(6.dp))
@@ -181,18 +188,42 @@ fun FlipsScreen(state: UiState, vm: AppViewModel) {
 
 @Composable
 private fun FlipsList(state: UiState) {
-    val rows = state.flips.filter { it.unitProfit >= state.minProfit }
+    // The site's vendor-flip list is sorted by total profit, so it fills up with bulk junk where
+    // the margin is a few copper per item. Those are not worth a click, let alone a trip to the
+    // auction house, so they are dropped: at least 1 silver per unit and 10% on the money.
+    val all = state.flips.sortedByDescending { it.unitProfit }
+    val rows = all.filter { it.unitProfit >= maxOf(state.minProfit, 100L) && (it.roi ?: 0.0) >= 10.0 }
     if (rows.isEmpty()) {
-        EmptyState("Нет позиций: рынок пуст или фильтр слишком строгий")
+        LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                PanelCard {
+                    Column {
+                        SectionTitle("НПС-флипов нет")
+                        Spacer(Modifier.height(6.dp))
+                        Caption(
+                            "На этом рынке цены аукциона стоят на уровне цены НПС: продавать вендору " +
+                                "почти нечего. Прибыль в 1–4 меди за штуку не окупает даже поход к аукциону.",
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Caption("Реальные деньги — во вкладке «Скидки рынка»: купить дешевле рынка и перепродать.")
+                    }
+                }
+            }
+        }
         return
     }
     LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             Caption(
-                "Купить на аукционе и сдать НПС. Прибыль — за все лоты по минимальной цене.",
+                "Купить на аукционе и сдать НПС. Прибыль — за все лоты по минимальной цене. " +
+                    "Показаны только позиции от 1с за штуку и от 10% окупаемости.",
             )
         }
         items(rows, key = { it.itemId }) { FlipCard(it) }
+        val hidden = all.size - rows.size
+        if (hidden > 0) {
+            item { Caption("Скрыто мелочи: $hidden поз. (прибыль меньше 1с за штуку)") }
+        }
     }
 }
 
@@ -238,14 +269,18 @@ private fun FlipCard(row: FlipRow) {
 
 @Composable
 private fun DealsList(state: UiState) {
-    val rows = state.deals.filter { (it.resaleProfit ?: it.saving) >= state.minProfit }
+    // Ranked by money actually made after the auction cut, not by the site's "saving" figure:
+    // a big discount on an item nobody buys is not profit.
+    val rows = state.deals
+        .filter { (it.resaleProfit ?: it.saving) >= state.minProfit }
+        .sortedByDescending { it.resaleProfit ?: it.saving }
     if (rows.isEmpty()) {
         EmptyState("Скидок под рынком не найдено")
         return
     }
     LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
-            Caption("Лоты дешевле рыночной цены. Перепродажа с учётом комиссии аукциона.")
+            Caption("Купить дешевле рынка и перепродать. Прибыль — после комиссии аукциона, по убыванию.")
         }
         items(rows, key = { it.itemId }) { DealCard(it) }
     }
@@ -271,9 +306,11 @@ private fun DealCard(row: DealRow) {
                     Caption("Сейчас ${Money.full(row.minBuyout)} · рынок ${Money.full(row.reference)}")
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Pill("−${Money.percent(row.discountPercent)}", Good)
+                    // Profit after the auction cut is the number that matters, not the discount.
+                    Money(row.resaleProfit ?: row.saving, Good, bold = true, fontSize = 14)
+                    Caption("прибыль после комиссии")
                     Spacer(Modifier.height(2.dp))
-                    Caption("выгода ${Money.short(row.saving)}")
+                    Pill("−${Money.percent(row.discountPercent)} к рынку", Good)
                 }
             }
             if (open) {
