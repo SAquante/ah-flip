@@ -282,7 +282,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // The auction tab must show the same fresh scan, not whatever it loaded earlier.
             val auction = loadWith("Обновляю аукцион…") { fetchAuction(s0) }
 
-            val everythingOk = deals != null && disenchant != null && crafting != null
+            // Freshness is only claimed when every section actually refreshed.
+            val everythingOk = deals != null && disenchant != null && crafting != null && auction != null
             update {
                 it.copy(
                     loading = false,

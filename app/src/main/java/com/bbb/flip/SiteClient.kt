@@ -94,9 +94,23 @@ class SiteClient {
 
     suspend fun get(path: String): String = gate.withLock {
         if (!ready) ensureReady()
+        try {
+            fetchWithRetries(path)
+        } catch (e: IOException) {
+            // The Cloudflare pass can expire mid-session; solve it again once before giving up.
+            if (e.message?.startsWith("429") == true || e.message?.contains("ограничил") == true) throw e
+            Log.w(TAG, "GET $path failed, re-checking the challenge: ${e.message}")
+            ready = false
+            bootstrapped = false
+            ensureReady()
+            fetchWithRetries(path)
+        }
+    }
+
+    private suspend fun fetchWithRetries(path: String): String {
         val url = if (path.startsWith("http")) path else Api.BASE + path
         var lastError = "нет ответа"
-        repeat(5) { attempt ->
+        repeat(4) { attempt ->
             val body = runCatching { loadJsonDocument(url) }.getOrElse {
                 lastError = it.message ?: "ошибка"
                 null

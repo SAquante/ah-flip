@@ -139,7 +139,7 @@ fun AuctionScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        PullRefresh(refreshing = state.ahLoading, onRefresh = { vm.loadAuction() }) {
+        PullRefresh(refreshing = state.ahLoading || state.loading, onRefresh = { vm.loadAuction() }) {
             if (state.ahItems.isEmpty()) {
                 EmptyState(if (state.ahLoading) "Загружаю аукцион…" else "Ничего не найдено")
             } else {
