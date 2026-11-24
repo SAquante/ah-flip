@@ -113,8 +113,8 @@ private fun AppRoot(state: UiState, vm: AppViewModel) {
                     state.tab == 5 -> StatsScreen(state, vm)
                     else -> SearchScreen(state, vm)
                 }
-                // Only block the screen when there is nothing to show; a refresh with cached
-                // data runs silently behind the UI.
+                // A refresh takes minutes (each request is a WebView navigation), so it must be
+                // obvious that it is running — otherwise the app looks frozen or "not updating".
                 if (state.loading && state.lastUpdated == 0L) LoadingOverlay(state.phase)
                 if (state.loading && state.lastUpdated > 0L) RefreshStrip(state.phase)
                 RuNames.progress?.let { (done, total) -> TranslationBar(done, total) }
@@ -135,21 +135,24 @@ private fun LoadingOverlay(phase: String) {
     }
 }
 
-/** Thin "refreshing" hint shown while cached data stays on screen. */
+/** Full-width "refreshing" bar while cached data stays readable underneath. */
 @Composable
 private fun RefreshStrip(phase: String) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
         Row(
             Modifier
-                .padding(bottom = 64.dp)
-                .clip(RoundedCornerShape(10.dp))
+                .fillMaxWidth()
+                .padding(bottom = 62.dp)
                 .background(Color(0xFF1D2431))
-                .padding(horizontal = 10.dp, vertical = 6.dp),
+                .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp, color = Gold)
-            Spacer(Modifier.width(8.dp))
-            Text(phase.ifBlank { "Обновляю…" }, color = Dim, fontSize = 11.sp)
+            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = Gold)
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text(phase.ifBlank { "Обновляю…" }, color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("Занимает 2–3 минуты, данные на экране пока старые", color = Dim, fontSize = 10.sp)
+            }
         }
     }
 }

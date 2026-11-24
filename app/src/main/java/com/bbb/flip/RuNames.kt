@@ -28,6 +28,7 @@ object RuNames {
     private const val UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0"
     private const val NO_TRANSLATION = ""   // cached "asked, nothing exists" marker
+    private const val MAX_PER_PASS = 60
 
     private val map = HashMap<Long, String>()
     private val asked = HashSet<Long>()
@@ -57,11 +58,16 @@ object RuNames {
 
     /** Fetches the names still missing among [ids]. */
     suspend fun resolve(ids: Collection<Long?>) {
-        val missing = ids.filterNotNull().distinct().filter { !asked.contains(it) }
+        val missing = ids.filterNotNull().distinct()
+            .filter { !asked.contains(it) }
+            // Cap per pass: translating hundreds of rows in one go keeps the UI busy for minutes
+            // and looks like a freeze. The rest is picked up on the next screen change.
+            .take(MAX_PER_PASS)
         if (missing.isEmpty()) return
         progress = 0 to missing.size
         var done = 0
         var added = 0
+        var lastReport = 0L
         coroutineScope {
             for (id in missing) launch {
                 val name = fetch(id)
@@ -71,9 +77,14 @@ object RuNames {
                         map[id] = name
                         added++
                     }
+                    done++
                 }
-                done++
-                progress = done to missing.size
+                // Report at most ~4 times a second: one update per item recomposes every list.
+                val now = System.currentTimeMillis()
+                if (now - lastReport > 250 || done == missing.size) {
+                    lastReport = now
+                    progress = done to missing.size
+                }
             }
         }
         progress = null

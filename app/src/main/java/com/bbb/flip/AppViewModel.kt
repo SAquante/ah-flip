@@ -362,7 +362,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     fun loadAuction() {
-        if (_state.value.ahLoading) return
+        // A full refresh already reloads the auction; requesting it here as well only queues a
+        // duplicate behind the same WebView and leaves the tab spinning.
+        if (_state.value.ahLoading || _state.value.loading) return
         viewModelScope.launch {
             val s = _state.value
             update { it.copy(ahLoading = true, error = null) }

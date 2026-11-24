@@ -139,9 +139,16 @@ fun AuctionScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        PullRefresh(refreshing = state.ahLoading || state.loading, onRefresh = { vm.loadAuction() }) {
+        // Pulling down runs the same full refresh as everywhere else, so the auction, flips and
+        // stats always show one consistent scan.
+        PullRefresh(refreshing = state.ahLoading || state.loading, onRefresh = { vm.refresh() }) {
             if (state.ahItems.isEmpty()) {
-                EmptyState(if (state.ahLoading) "Загружаю аукцион…" else "Ничего не найдено")
+                EmptyState(
+                    when {
+                        state.ahLoading || state.loading -> "Загружаю аукцион…"
+                        else -> "Ничего не найдено"
+                    },
+                )
             } else {
                 LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item {
@@ -251,9 +258,20 @@ private fun AuctionRow(row: SearchItem) {
 fun StatsScreen(state: UiState, vm: AppViewModel) {
     LaunchedEffect(Unit) { if (state.trending.isEmpty()) vm.loadTrending() }
 
+    // Sales data only exists for rows the site already estimates sold/day for (deals and
+    // recipes); the auction browse endpoint carries no sales figures at all.
+    val sellers = remember(state.deals, state.crafts) { topSellers(state) }
+
     PullRefresh(refreshing = state.statsLoading, onRefresh = { vm.loadTrending() }) {
         LazyColumn(contentPadding = ListPadding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item { StatsSummary(state) }
+            item { ListHeader("Продажи: день / неделя / месяц") }
+            if (sellers.isEmpty()) {
+                item { EmptyState("Нет оценок продаж — обновите данные") }
+            } else {
+                item { Caption("Оценка сайта по истории сканов. Считается только для позиций, где сайт её даёт (скидки и рецепты).") }
+                items(sellers, key = { "s${it.itemId}" }) { SellerRow(it) }
+            }
             item { ListHeader("Движения рынка за ${windowLabel(state.trendingWindow)}") }
             if (state.trending.isEmpty()) {
                 item { EmptyState(if (state.statsLoading) "Считаю статистику…" else "Нет данных") }
@@ -262,6 +280,60 @@ fun StatsScreen(state: UiState, vm: AppViewModel) {
             }
             item { ListHeader("Сводка по рынку") }
             item { MarketStatsCard(state) }
+        }
+    }
+}
+
+private data class Seller(
+    val itemId: Long,
+    val name: String,
+    val iconUrl: String?,
+    val quality: String?,
+    val perDay: Double,
+    val price: Long?,
+)
+
+/** Rows that carry a sold-per-day estimate, best sellers first. */
+private fun topSellers(state: UiState): List<Seller> {
+    val fromDeals = state.deals.mapNotNull { row ->
+        val perDay = row.soldPerDay ?: return@mapNotNull null
+        if (perDay <= 0) return@mapNotNull null
+        Seller(row.itemId, row.name, row.iconUrl, row.quality, perDay, row.minBuyout)
+    }
+    val fromCrafts = state.crafts.mapNotNull { row ->
+        val perDay = row.soldPerDay ?: return@mapNotNull null
+        if (perDay <= 0) return@mapNotNull null
+        Seller(row.result.itemId, row.result.name, row.result.iconUrl, row.result.quality, perDay, row.sellsFor)
+    }
+    return (fromDeals + fromCrafts).sortedByDescending { it.perDay }.take(15)
+}
+
+@Composable
+private fun SellerRow(seller: Seller) {
+    PanelCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ItemIcon(seller.iconUrl, seller.quality)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    ruName(seller.itemId, seller.name),
+                    color = qualityColor(seller.quality),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Caption("цена ${Money.full(seller.price)}")
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    Money.salesPerPeriod(seller.perDay) ?: "—",
+                    color = Good,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Caption("шт: день / нед / мес")
+            }
         }
     }
 }

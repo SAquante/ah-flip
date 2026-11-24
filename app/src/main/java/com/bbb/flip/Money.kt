@@ -48,6 +48,17 @@ object Money {
     fun fmt(value: Double, digits: Int): String =
         String.format(java.util.Locale.US, "%.${digits}f", value).replace('.', ',')
 
+    /** "12,5 / 88 / 375" — per day, per week, per month from a per-day estimate. */
+    fun salesPerPeriod(perDay: Double?): String? {
+        if (perDay == null) return null
+        val month = perDay * 30
+        return when {
+            perDay >= 100 -> "${fmt(perDay, 0)} / ${fmt(perDay * 7, 0)} / ${fmt(month, 0)}"
+            perDay >= 10 -> "${fmt(perDay, 1)} / ${fmt(perDay * 7, 1)} / ${fmt(month, 0)}"
+            else -> "${fmt(perDay, 2)} / ${fmt(perDay * 7, 1)} / ${fmt(month, 1)}"
+        }
+    }
+
     fun percent(value: Double?): String =
         if (value == null) "—" else "${fmt(value, 1)}%"
 
