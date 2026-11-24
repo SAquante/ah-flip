@@ -205,14 +205,17 @@ private fun BottomBar(state: UiState, vm: AppViewModel) {
                 .background(Color(0xFF0D1117))
                 .padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Weighted tabs: with 9 items a fixed padding pushes the last ones off-screen.
             tabs.forEachIndexed { index, label ->
                 val selected = !state.settingsOpen && state.tab == index
                 Column(
                     Modifier
+                        .weight(1f)
                         .clip(RoundedCornerShape(8.dp))
                         .clickable { vm.openSettings(false); vm.selectTab(index) }
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                        .padding(vertical = 4.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
@@ -233,9 +236,10 @@ private fun BottomBar(state: UiState, vm: AppViewModel) {
             }
             Column(
                 Modifier
+                    .weight(0.7f)
                     .clip(RoundedCornerShape(8.dp))
                     .clickable(enabled = !state.loading) { vm.refresh() }
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(vertical = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text("⟳", color = if (state.loading) Dim else Gold, fontSize = 14.sp)
@@ -244,9 +248,10 @@ private fun BottomBar(state: UiState, vm: AppViewModel) {
             }
             Column(
                 Modifier
+                    .weight(0.7f)
                     .clip(RoundedCornerShape(8.dp))
                     .clickable { vm.openSettings(true) }
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(vertical = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text("⚙", color = if (state.settingsOpen) Gold else Dim, fontSize = 13.sp)

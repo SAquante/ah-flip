@@ -24,9 +24,16 @@ import java.io.IOException
  * plain HTTP client gets 403 even with the clearance cookie.
  *
  * Transport: the WebView is navigated straight to the API URL and the rendered JSON document is
- * read back. Navigation gives every request its own document, which sidesteps the two things that
- * made same-document `fetch()` unreliable here — a JS context that dies after one call, and the
- * site's own SPA scripts reloading the page mid-request.
+ * read back. Navigation gives every request its own document, which avoids the two things that
+ * made same-document `fetch()` unusable here — a JS context that dies after one call, and the
+ * site's SPA scripts reloading the page mid-request.
+ *
+ * Rules learned the hard way, all encoded below:
+ *  - WebView treats JSON -> JSON as a download (the document never commits), so `about:blank` is
+ *    loaded in between, and it must be given time to actually finish;
+ *  - `evaluateJavascript` blocks while a document is loading and can swallow the next navigation,
+ *    so nothing is read until a fixed settle delay has passed;
+ *  - `onPageFinished` is not reliable for JSON documents, so the document itself is inspected.
  */
 class SiteClient {
 
@@ -34,11 +41,10 @@ class SiteClient {
     private var webView: WebView? = null
     private var ready = false
     private var bootstrapped = false
-    private var loadSeq = 0
 
-    /** Bumped by every completed page load, so navigation can be awaited reliably. */
+    /** URL of the most recent finished load: the only reliable "document is ready" signal. */
     @Volatile
-    private var loads = 0
+    private var lastFinishedUrl = ""
 
     fun bind(view: WebView) {
         if (webView === view) return
@@ -50,7 +56,7 @@ class SiteClient {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            // Prices must be live; a cached /api/ response showed an hour-old scan.
+            // Prices must be live; a cached /api/ response once showed an hour-old scan.
             cacheMode = WebSettings.LOAD_NO_CACHE
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
@@ -63,7 +69,7 @@ class SiteClient {
         view.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 Log.d(TAG, "page finished: $url")
-                loads++
+                if (url != null) lastFinishedUrl = url
             }
 
             override fun shouldInterceptRequest(
@@ -73,7 +79,7 @@ class SiteClient {
                 val url = request?.url ?: return null
                 val host = url.host ?: return null
                 // Keep the document and the Cloudflare challenge; drop ads, trackers, fonts,
-                // images and the SPA bundles (so no service worker, and a light challenge page).
+                // images and the SPA bundles (so no service worker, and a light page).
                 if (host == "challenges.cloudflare.com") return null
                 if (host.endsWith("bootybaybroker.com")) {
                     val path = url.path ?: "/"
@@ -97,9 +103,9 @@ class SiteClient {
         try {
             fetchWithRetries(path)
         } catch (e: IOException) {
-            // The Cloudflare pass can expire mid-session; solve it again once before giving up.
-            if (e.message?.startsWith("429") == true || e.message?.contains("ограничил") == true) throw e
-            Log.w(TAG, "GET $path failed, re-checking the challenge: ${e.message}")
+            // The Cloudflare pass can expire mid-session; solve it once more before giving up.
+            if (e.message?.contains("ограничил") == true) throw e
+            Log.w(TAG, "GET $path failed (${e.message}), re-checking the challenge")
             ready = false
             bootstrapped = false
             ensureReady()
@@ -110,8 +116,8 @@ class SiteClient {
     private suspend fun fetchWithRetries(path: String): String {
         val url = if (path.startsWith("http")) path else Api.BASE + path
         var lastError = "нет ответа"
-        repeat(4) { attempt ->
-            val body = runCatching { loadJsonDocument(url) }.getOrElse {
+        repeat(3) { attempt ->
+            val body = runCatching { loadJsonDocument(url, attempt) }.getOrElse {
                 lastError = it.message ?: "ошибка"
                 null
             }
@@ -121,14 +127,12 @@ class SiteClient {
                 val err = runCatching { apiJson.decodeFromString<ErrorEnvelope>(body) }
                     .getOrNull()?.takeIf { it.status >= 400 }
                 if (err != null) {
-                    val message = "${err.status} ${err.detail ?: err.title ?: ""}".trim()
                     if (err.status == 429) throw IOException(rateLimitMessage(body))
-                    throw IOException(message)
+                    throw IOException("${err.status} ${err.detail ?: err.title ?: ""}".trim())
                 }
                 return body
             }
             Log.w(TAG, "GET $path attempt ${attempt + 1} failed: $lastError")
-            delay(400)
         }
         throw IOException(lastError)
     }
@@ -149,53 +153,67 @@ class SiteClient {
             }
         }
         // The real page runs the challenge and sets cf_clearance.
-        waitForLoads(20_000)
-        var status = 0
-        repeat(15) { attempt ->
-            val probe = runCatching { loadJsonDocument("${Api.BASE}/api/config") }.getOrNull()
-            if (probe != null && probe.trimStart().startsWith("{")) {
+        delay(6_000)
+        repeat(12) { attempt ->
+            val probe = runCatching { loadJsonDocument("${Api.BASE}/api/config", 0) }.getOrNull()
+            if (probe != null) {
                 ready = true
                 Log.d(TAG, "ready after ${attempt + 1} probe(s)")
                 return
             }
-            status = attempt + 1
             delay(700)
         }
-        throw IOException("Cloudflare не пропустил запросы (попыток: $status). Проверьте интернет.")
+        throw IOException("Cloudflare не пропустил запросы. Проверьте интернет и повторите.")
     }
 
     /**
-     * Navigates to [url] and returns the document text. WebView treats JSON -> JSON as a download
-     * (the document never commits), so a blank document is loaded in between; the read is gated on
-     * a completed load, the document reporting [url] as its own location, and the text parsing as
-     * complete JSON.
+     * Navigates to [url] and returns the document text. [attempt] widens the settle delays, because
+     * a slow first document is the usual reason a round comes back empty.
      */
-    private suspend fun loadJsonDocument(url: String): String {
-        navigate("about:blank", 6_000)
-        navigate(url, 20_000)
-        // onPageFinished can arrive from the previous navigation, so poll the document itself:
-        // it must be complete, report the requested URL, and parse as full JSON.
-        repeat(30) {
-            val doc = readDocument()
-            if (doc != null && doc.url.startsWith(url) && doc.text.length > 1 && !doc.html) {
-                if (runCatching { apiJson.parseToJsonElement(doc.text) }.isSuccess) return doc.text
-            }
-            delay(250)
+    private suspend fun loadJsonDocument(url: String, attempt: Int): String {
+        // JSON -> JSON is treated as a download, so reset to a blank document first.
+        loadUrl("about:blank")
+        awaitFinish("about:blank", 8_000)
+        loadUrl(url)
+        // onPageFinished is the only signal that the JSON document has committed. Reading or
+        // navigating earlier kills it — the reads below only start once the page reports done.
+        if (!awaitFinish(url, 25_000)) {
+            Log.d(TAG, "no load event for $url (attempt ${attempt + 1})")
+            throw IOException("Аукцион вернул не данные")
         }
-        throw IOException("Аукцион вернул не данные (возможно, проверка Cloudflare)")
+        // onPageFinished fires before the document is fully parsed, so read until the text stops
+        // growing: a partial read yields truncated JSON.
+        var previous = ""
+        repeat(12) {
+            val doc = readDocument()
+            if (doc != null && doc.url.startsWith(url) && !doc.html) {
+                val text = doc.text
+                if (text.length > 1 && text == previous) {
+                    if (runCatching { apiJson.parseToJsonElement(text) }.isSuccess) return text
+                }
+                previous = text
+            }
+            delay(400)
+        }
+        val doc = readDocument()
+        Log.d(
+            TAG,
+            "attempt ${attempt + 1} for $url: " +
+                (doc?.let { "url=${it.url.take(70)} html=${it.html} len=${it.text.length}" } ?: "no document"),
+        )
+        throw IOException("Аукцион вернул не данные")
     }
 
-    private suspend fun navigate(target: String, timeoutMs: Long) {
+    /** Waits until a load of [target] has finished; false on timeout. */
+    private suspend fun awaitFinish(target: String, timeoutMs: Long): Boolean =
+        withTimeoutOrNull(timeoutMs) {
+            while (!lastFinishedUrl.startsWith(target)) delay(100)
+            true
+        } ?: false
+
+    private suspend fun loadUrl(target: String) {
         val view = webView ?: throw IOException("Соединение не инициализировано")
         withContext(Dispatchers.Main.immediate) { view.loadUrl(target) }
-        waitForLoads(timeoutMs)
-    }
-
-    private suspend fun waitForLoads(timeoutMs: Long) {
-        val before = loads
-        withTimeoutOrNull(timeoutMs) {
-            while (loads <= before) delay(80)
-        }
     }
 
     private class Document(val url: String, val html: Boolean, val text: String)
@@ -205,11 +223,11 @@ class SiteClient {
         val view = webView ?: return@withContext null
         val head = evalString(
             view,
-            "(document.readyState==='complete'?'1':'0') + '|' + location.href + '|' + " +
-                "(document.contentType.indexOf('json')<0 ? 'HTML' : 'JSON')",
+            "location.href + '|' + (document.contentType.indexOf('json')<0 ? 'HTML' : 'JSON')",
         )
-        val parts = head.split("|", limit = 3)
-        if (parts.size < 3 || parts[0] != "1") return@withContext null
+        if (head.isEmpty()) return@withContext null
+        val parts = head.split("|", limit = 2)
+        if (parts.size < 2) return@withContext null
         val chunk = 40_000
         val sb = StringBuilder()
         var offset = 0
@@ -224,13 +242,13 @@ class SiteClient {
             offset += chunk
             if (offset > 4_000_000) break
         }
-        Document(parts[1], parts[2] == "HTML", sb.toString())
+        Document(parts[0], parts[1] == "HTML", sb.toString())
     }
 
     private suspend fun evalString(view: WebView, js: String): String {
         val done = CompletableDeferred<String>()
         view.evaluateJavascript(js) { raw -> done.complete(decodeJsString(raw ?: "")) }
-        return withTimeout(15_000) { done.await() }
+        return withTimeout(10_000) { done.await() }
     }
 
     /** evaluateJavascript returns a JS string literal; JSON-escaped. */
