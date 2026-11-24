@@ -21,15 +21,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -37,7 +41,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 
 private val Scheme = darkColorScheme(
     primary = Gold,
@@ -52,6 +58,10 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var vm: AppViewModel
     private lateinit var webView: WebView
+
+    /** Set when GitHub reports a newer release; drives the update dialog. */
+    private val updateState = mutableStateOf<Updates.Release?>(null)
+    private var updateShown = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,6 +86,16 @@ class MainActivity : ComponentActivity() {
                         MaterialTheme(colorScheme = Scheme) {
                             val state by vm.state.collectAsState()
                             AppRoot(state, vm)
+                            updateState.value?.let { release ->
+                                UpdateDialog(
+                                    release = release,
+                                    onInstall = {
+                                        Updates.downloadAndInstall(this@MainActivity, release)
+                                        updateState.value = null
+                                    },
+                                    onDismiss = { updateState.value = null },
+                                )
+                            }
                         }
                     }
                 },
@@ -87,6 +107,23 @@ class MainActivity : ComponentActivity() {
         }
         setContentView(root)
         vm.bindWebView(webView)
+        checkForUpdate()
+    }
+
+    /**
+     * Asks GitHub Releases for a newer build once per launch. Silent on failure — an update check
+     * must never get in the way of using the app.
+     */
+    private fun checkForUpdate() {
+        if (updateShown) return
+        lifecycleScope.launch {
+            val release = Updates.check() ?: return@launch
+            if (isFinishing || isDestroyed) return@launch
+            updateShown = true
+            // Compose reads this state; setting it from a coroutine off the main thread would not
+            // trigger recomposition reliably.
+            runOnUiThread { updateState.value = release }
+        }
     }
 
     override fun onDestroy() {
@@ -122,6 +159,46 @@ private fun AppRoot(state: UiState, vm: AppViewModel) {
             }
         }
     }
+}
+
+@Composable
+private fun UpdateDialog(
+    release: Updates.Release,
+    onInstall: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Panel,
+        titleContentColor = Gold,
+        textContentColor = Color(0xFFE7E9EE),
+        title = { Text("Вышло обновление ${release.version}") },
+        text = {
+            Column {
+                Text(
+                    "Установлено: ${BuildConfig.VERSION_NAME}",
+                    color = Dim,
+                    fontSize = 12.sp,
+                )
+                if (release.notes.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(release.notes, fontSize = 12.sp, maxLines = 12)
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "APK скачается и откроется системный установщик.",
+                    color = Dim,
+                    fontSize = 11.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onInstall) { Text("Скачать и установить", color = Gold) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Позже", color = Dim) }
+        },
+    )
 }
 
 @Composable
